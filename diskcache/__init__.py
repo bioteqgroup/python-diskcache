@@ -3,11 +3,13 @@
 from .core import Cache, Disk, UnknownFileWarning, EmptyDirWarning, Timeout
 from .core import DEFAULT_SETTINGS, ENOVAL, EVICTION_POLICY, UNKNOWN
 from .fanout import FanoutCache
+from .gzipdisk import GzipDisk
 from .persistent import Deque, Index
 
 __all__ = [
     'Cache',
     'Disk',
+    'GzipDisk',
     'UnknownFileWarning',
     'EmptyDirWarning',
     'Timeout',

@@ -145,6 +145,7 @@ disable=print-statement,
         inconsistent-return-statements,
         ungrouped-imports,
         not-callable,
+        bad-continuation,
         duplicate-code  # PyCQA/pylint #1055
 
 # Enable the message, report, category or checker with the given id(s). You can

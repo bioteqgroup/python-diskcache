@@ -15,3 +15,5 @@ sphinx
 tox
 twine
 wheel
+aiofiles
+aiosqlite

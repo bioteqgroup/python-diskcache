@@ -2,9 +2,11 @@
 
 """
 
+import asyncio
 from functools import wraps
 
 MARK = object()
+
 
 def memoize(cache, name=None, typed=False, expire=None, tag=None):
     """Memoizing cache decorator.
@@ -58,7 +60,7 @@ def memoize(cache, name=None, typed=False, expire=None, tag=None):
     """
     # Caution: Nearly identical code exists in DjangoCache.memoize
     if callable(name):
-        raise TypeError('name cannot be callable')
+        raise TypeError("name cannot be callable")
 
     def decorator(function):
         "Decorator created by memoize call for callable."
@@ -75,7 +77,7 @@ def memoize(cache, name=None, typed=False, expire=None, tag=None):
         reference = (reference,)
 
         @wraps(function)
-        def wrapper(*args, **kwargs):
+        async def wrapper(*args, **kwargs):
             "Wrapper for callable to cache arguments and return values."
 
             key = reference + args
@@ -93,11 +95,13 @@ def memoize(cache, name=None, typed=False, expire=None, tag=None):
                 if kwargs:
                     key += tuple(type(value) for _, value in sorted_items)
 
-            result = cache.get(key, default=MARK, retry=True)
+            result = await cache.get(key, default=MARK, retry=True)
 
             if result is MARK:
                 result = function(*args, **kwargs)
-                cache.set(key, result, expire=expire, tag=tag, retry=True)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                await cache.set(key, result, expire=expire, tag=tag, retry=True)
 
             return result
 

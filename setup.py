@@ -1,8 +1,6 @@
 from setuptools import setup
 from setuptools.command.test import test as TestCommand
 
-import diskcache
-
 
 class Tox(TestCommand):
     def finalize_options(self):
@@ -18,9 +16,17 @@ class Tox(TestCommand):
 with open('README.rst') as reader:
     readme = reader.read()
 
+__title__ = 'diskcache'
+__version__ = '3.1.1'
+__build__ = 0x030101
+__author__ = 'Grant Jenks'
+__license__ = 'Apache 2.0'
+__copyright__ = 'Copyright 2016-2018 Grant Jenks'
+
+
 setup(
-    name=diskcache.__title__,
-    version=diskcache.__version__,
+    name=__title__,
+    version=__version__,
     description='Disk Cache -- Disk and file backed persistent cache.',
     long_description=readme,
     author='Grant Jenks',
@@ -30,7 +36,7 @@ setup(
     packages=['diskcache'],
     tests_require=['tox'],
     cmdclass={'test': Tox},
-    install_requires=[],
+    install_requires=["aiofiles", "aiosqlite"],
     classifiers=(
         'Development Status :: 5 - Production/Stable',
         'Intended Audience :: Developers',
