@@ -3,8 +3,30 @@
 """
 # pylint: disable=not-async-context-manager,missing-docstring,too-many-public-methods,too-many-instance-attributes
 import asyncio
+import codecs
+import errno
+import os
+import os.path as op
+import pickle
+import pickletools
+import sqlite3
+import struct
+import threading
+import time
+import uuid
+import warnings
+import zlib
+from io import BytesIO  # pylint: disable=ungrouped-imports
+from threading import get_ident
+
+import aiofiles
+import aiosqlite
+
+from .memo import memoize
+
 try:
     import uvloop
+
     if not isinstance(asyncio.get_event_loop_policy(), uvloop.EventLoopPolicy):
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     print("Using uvloop")
@@ -16,46 +38,6 @@ try:
 except:
     from aiotools import actxmgr as asynccontextmanager
 
-import codecs
-import errno
-import io
-import os
-import os.path as op
-import pickletools
-import sqlite3
-import struct
-import sys
-import threading
-import time
-import warnings
-import zlib
-
-import aiofiles
-import aiosqlite
-
-from .memo import memoize
-
-if sys.hexversion < 0x03000000:
-    import cPickle as pickle  # pylint: disable=import-error
-
-    # ISSUE #25 Fix for http://bugs.python.org/issue10211
-    from cStringIO import StringIO as BytesIO  # pylint: disable=import-error
-    from thread import get_ident  # pylint: disable=import-error,no-name-in-module
-
-    TextType = unicode  # pylint: disable=invalid-name,undefined-variable
-    BytesType = str
-    INT_TYPES = int, long  # pylint: disable=undefined-variable
-    range = xrange  # pylint: disable=redefined-builtin,invalid-name,undefined-variable
-    io_open = io.open  # pylint: disable=invalid-name
-else:
-    import pickle
-    from io import BytesIO  # pylint: disable=ungrouped-imports
-    from threading import get_ident
-
-    TextType = str
-    BytesType = bytes
-    INT_TYPES = (int,)
-    io_open = open  # pylint: disable=invalid-name
 
 try:
     WindowsError
@@ -105,23 +87,17 @@ METADATA = {u"count": 0, u"size": 0, u"hits": 0, u"misses": 0}
 EVICTION_POLICY = {
     "none": {"init": None, "get": None, "cull": None},
     "least-recently-stored": {
-        "init": (
-            "CREATE INDEX IF NOT EXISTS Cache_store_time ON" " Cache (store_time)"
-        ),
+        "init": "CREATE INDEX IF NOT EXISTS Cache_store_time ON Cache (store_time)",
         "get": None,
         "cull": "SELECT {fields} FROM Cache ORDER BY store_time LIMIT ?",
     },
     "least-recently-used": {
-        "init": (
-            "CREATE INDEX IF NOT EXISTS Cache_access_time ON" " Cache (access_time)"
-        ),
+        "init": "CREATE INDEX IF NOT EXISTS Cache_access_time ON Cache (access_time)",
         "get": "access_time = {now}",
         "cull": "SELECT {fields} FROM Cache ORDER BY access_time LIMIT ?",
     },
     "least-frequently-used": {
-        "init": (
-            "CREATE INDEX IF NOT EXISTS Cache_access_count ON" " Cache (access_count)"
-        ),
+        "init": "CREATE INDEX IF NOT EXISTS Cache_access_count ON Cache (access_count)",
         "get": "access_count = access_count + 1",
         "cull": "SELECT {fields} FROM Cache ORDER BY access_count LIMIT ?",
     },
@@ -156,11 +132,11 @@ class Disk(object):
 
         if type_disk_key is sqlite3.Binary:
             return zlib.adler32(disk_key) & mask
-        elif type_disk_key is TextType:
+        elif type_disk_key is str:
             return (
                 zlib.adler32(disk_key.encode("utf-8")) & mask
             )  # pylint: disable=no-member
-        elif type_disk_key in INT_TYPES:
+        elif type_disk_key is int:
             return disk_key % mask
         else:
             assert type_disk_key is float
@@ -176,14 +152,11 @@ class Disk(object):
         # pylint: disable=bad-continuation,unidiomatic-typecheck
         type_key = type(key)
 
-        if type_key is BytesType:
+        if type_key is bytes:
             return sqlite3.Binary(key), True
         elif (
-            (type_key is TextType)
-            or (
-                type_key in INT_TYPES
-                and -9223372036854775808 <= key <= 9223372036854775807
-            )
+            (type_key is str)
+            or (type_key is int and -9223372036854775808 <= key <= 9223372036854775807)
             or (type_key is float)
         ):
             return key, True
@@ -202,9 +175,14 @@ class Disk(object):
         """
         # pylint: disable=no-self-use,unidiomatic-typecheck
         if raw:
-            return BytesType(key) if type(key) is sqlite3.Binary else key
+            return bytes(key) if type(key) is sqlite3.Binary else key
         else:
             return pickle.load(BytesIO(key))
+
+    def size(self, key):
+        _, full_path = self.filename(key)
+
+        return op.getsize(full_path)
 
     async def store(self, value, read, key=UNKNOWN):
         """Convert `value` to fields size, mode, filename, and value for Cache
@@ -219,17 +197,7 @@ class Disk(object):
         # pylint: disable=unidiomatic-typecheck
         type_value = type(value)
         min_file_size = self.min_file_size
-
-        if (
-            (type_value is TextType and len(value) < min_file_size)
-            or (
-                type_value in INT_TYPES
-                and -9223372036854775808 <= value <= 9223372036854775807
-            )
-            or (type_value is float)
-        ):
-            return 0, MODE_RAW, None, value
-        elif type_value is BytesType:
+        if type_value is bytes:
             if len(value) < min_file_size:
                 return 0, MODE_RAW, None, sqlite3.Binary(value)
             else:
@@ -239,7 +207,16 @@ class Disk(object):
                     await writer.write(value)
 
                 return len(value), MODE_BINARY, filename, None
-        elif type_value is TextType:
+        elif (
+            (type_value is str and len(value) < min_file_size)
+            or (
+                type_value is int
+                and -9223372036854775808 <= value <= 9223372036854775807
+            )
+            or (type_value is float)
+        ):
+            return 0, MODE_RAW, None, value
+        elif type_value is str:
             filename, full_path = self.filename(key, value)
 
             async with aiofiles.open(full_path, "w", encoding="UTF-8") as writer:
@@ -285,7 +262,7 @@ class Disk(object):
         """
         # pylint: disable=no-self-use,unidiomatic-typecheck
         if mode == MODE_RAW:
-            return BytesType(value) if type(value) is sqlite3.Binary else value
+            return bytes(value) if type(value) is sqlite3.Binary else value
         elif mode == MODE_BINARY:
             if read:
                 return aiofiles.open(op.join(self._directory, filename), "rb")
@@ -326,7 +303,7 @@ class Disk(object):
 
         """
         # pylint: disable=unused-argument
-        hex_name = codecs.encode(os.urandom(16), "hex").decode("utf-8")
+        hex_name = uuid.uuid4().hex
         sub_dir = op.join(hex_name[:2], hex_name[2:4])
         name = hex_name[4:] + ".val"
         directory = op.join(self._directory, sub_dir)
@@ -491,12 +468,12 @@ class Cache(object):
         )
 
         await self.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS Cache_key_raw ON" " Cache(key, raw)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS Cache_key_raw ON Cache(key, raw)",
             retry=True,
         )
 
         await self.execute(
-            "CREATE INDEX IF NOT EXISTS Cache_expire_time ON" " Cache (expire_time)",
+            "CREATE INDEX IF NOT EXISTS Cache_expire_time ON Cache (expire_time)",
             retry=True,
         )
 
@@ -619,6 +596,20 @@ class Cache(object):
 
         cursor = await sql(query, args)
         res = []
+        if cursor:
+            res = await cursor.fetchall()
+            await cursor.close()
+
+        return res
+
+    async def fetchone(self, query, args=None, retry=False, sql=None):
+        if not retry:
+            sql = sql or await self._sql_executor()
+        else:
+            sql = sql or self._sql_retry
+
+        cursor = await sql(query, args)
+        res = None
         if cursor:
             res = await cursor.fetchall()
             await cursor.close()
@@ -783,7 +774,7 @@ class Cache(object):
 
         async with self._transact(retry, filename) as (sql, cleanup):
             rows = await self.fetchall(
-                "SELECT rowid, filename FROM Cache" " WHERE key = ? AND raw = ?",
+                "SELECT rowid, filename FROM Cache WHERE key = ? AND raw = ?",
                 (db_key, raw),
                 sql=sql,
             )
@@ -835,6 +826,42 @@ class Cache(object):
             " key, raw, store_time, expire_time, access_time,"
             " access_count, tag, size, mode, filename, value"
             ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                key,
+                raw,
+                now,  # store_time
+                expire_time,
+                now,  # access_time
+                0,  # access_count
+                tag,
+                size,
+                mode,
+                filename,
+                value,
+            ),
+            sql=sql,
+        )
+
+    async def _row_upsert(self, key, raw, now, columns, sql=None):
+        expire_time, tag, size, mode, filename, value = columns
+        await self.execute(
+            """INSERT INTO Cache(
+                 key, raw, store_time, expire_time, access_time,
+                 access_count, tag, size, mode, filename, value
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key, raw)
+                DO UPDATE SET (
+                    store_time=excluded.store_time,
+                    expire_time=excluded.expire_time,
+                    access_time=excluded.access_time,
+                    access_count=excluded.access_count,
+                    tag=excluded.tag,
+                    size=excluded.size,
+                    mode=excluded.mode,
+                    filename=excluded.filename,
+                    value=excluded.value
+                )
+            """,
             (
                 key,
                 raw,
@@ -921,7 +948,7 @@ class Cache(object):
 
         async with self._transact(retry) as (sql, _):
             rows = await self.fetchall(
-                "SELECT rowid, expire_time FROM Cache" " WHERE key = ? AND raw = ?",
+                "SELECT rowid, expire_time FROM Cache WHERE key = ? AND raw = ?",
                 (db_key, raw),
                 sql=sql,
             )
@@ -1095,6 +1122,27 @@ class Cache(object):
         """
         return await self.incr(key, -delta, default, retry)
 
+    async def size(self, key):
+        db_key, raw = self._disk.put(key)
+        select = (
+            "SELECT mode, filename, length(value)"
+            " FROM Cache WHERE key = ? AND raw = ?"
+            " AND (expire_time IS NULL OR expire_time > ?)"
+        )
+        row = await self.fetchone(select, (db_key, raw, time.time()))
+        if not row:
+            return None
+
+        mode, filename, size = row
+        if mode == MODE_BINARY:
+            try:
+                full_path = op.join(self._directory, filename)
+                size = op.getsize(full_path)
+            except Exception:
+                pass
+
+        return size
+
     async def get(
         self, key, default=None, read=False, expire_time=False, tag=False, retry=False
     ):
@@ -1131,12 +1179,12 @@ class Cache(object):
         if not self.statistics and update_column is None:
             # Fast path, no transaction necessary.
 
-            rows = await self.fetchall(select, (db_key, raw, time.time()))
+            row = await self.fetchone(select, (db_key, raw, time.time()))
 
-            if not rows:
+            if not row:
                 return default
 
-            (rowid, db_expire_time, db_tag, mode, filename, db_value), = rows
+            rowid, db_expire_time, db_tag, mode, filename, db_value = row
 
             try:
                 value = await self._disk.fetch(mode, filename, db_value, read)
@@ -1149,14 +1197,14 @@ class Cache(object):
             cache_miss = 'UPDATE Settings SET value = value + 1 WHERE key = "misses"'
 
             async with self._transact(retry) as (sql, _):
-                rows = await self.fetchall(select, (db_key, raw, time.time()), sql=sql)
+                row = await self.fetchone(select, (db_key, raw, time.time()), sql=sql)
 
-                if not rows:
+                if not row:
                     if self.statistics:
                         await self.execute(cache_miss, sql=sql)
                     return default
 
-                (rowid, db_expire_time, db_tag, mode, filename, db_value), = rows
+                rowid, db_expire_time, db_tag, mode, filename, db_value = row
 
                 try:
                     value = await self._disk.fetch(mode, filename, db_value, read)
@@ -1816,7 +1864,7 @@ class Cache(object):
 
                             if fix:
                                 await self.execute(
-                                    "UPDATE Cache SET size = ?" " WHERE rowid = ?",
+                                    "UPDATE Cache SET size = ? WHERE rowid = ?",
                                     (real_size, rowid),
                                     sql=sql,
                                 )
@@ -2094,14 +2142,14 @@ class Cache(object):
         _disk_get = self._disk.get
 
         if reverse:
-            select = "SELECT key, raw FROM Cache" " ORDER BY key DESC, raw DESC LIMIT 1"
+            select = "SELECT key, raw FROM Cache ORDER BY key DESC, raw DESC LIMIT 1"
             iterate = (
                 "SELECT key, raw FROM Cache"
                 " WHERE key = ? AND raw < ? OR key < ?"
                 " ORDER BY key DESC, raw DESC LIMIT ?"
             )
         else:
-            select = "SELECT key, raw FROM Cache" " ORDER BY key ASC, raw ASC LIMIT 1"
+            select = "SELECT key, raw FROM Cache ORDER BY key ASC, raw ASC LIMIT 1"
             iterate = (
                 "SELECT key, raw FROM Cache"
                 " WHERE key = ? AND raw > ? OR key > ?"
